@@ -1,0 +1,784 @@
+-- SocialHub AI Database Schema
+-- PostgreSQL 15+
+
+-- ============================================================================
+-- EXTENSIONS
+-- ============================================================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ============================================================================
+-- USERS & AUTHENTICATION
+-- ============================================================================
+
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255),
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    avatar_url TEXT,
+    status VARCHAR(50) DEFAULT 'active', -- active, inactive, suspended
+    email_verified BOOLEAN DEFAULT FALSE,
+    email_verified_at TIMESTAMP,
+    phone_number VARCHAR(20),
+    timezone VARCHAR(50) DEFAULT 'UTC',
+    language VARCHAR(10) DEFAULT 'en',
+    two_factor_enabled BOOLEAN DEFAULT FALSE,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
+);
+
+CREATE TABLE user_oauth_providers (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL, -- 'google', 'facebook', 'meta'
+    provider_user_id VARCHAR(255) NOT NULL,
+    access_token TEXT ENCRYPTED, -- Use pgcrypto for encryption
+    refresh_token TEXT ENCRYPTED,
+    token_expires_at TIMESTAMP,
+    email VARCHAR(255),
+    profile_data JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider, provider_user_id)
+);
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_status ON users(status);
+CREATE INDEX idx_oauth_providers_user_id ON user_oauth_providers(user_id);
+
+-- ============================================================================
+-- WORKSPACES & TEAM MANAGEMENT
+-- ============================================================================
+
+CREATE TABLE workspaces (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(255) UNIQUE NOT NULL,
+    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    description TEXT,
+    logo_url TEXT,
+    website VARCHAR(255),
+    timezone VARCHAR(50) DEFAULT 'UTC',
+    language VARCHAR(10) DEFAULT 'en',
+    status VARCHAR(50) DEFAULT 'active',
+    settings JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
+);
+
+CREATE TABLE workspace_members (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(50) NOT NULL DEFAULT 'agent', -- owner, admin, agent
+    status VARCHAR(50) DEFAULT 'active',
+    invited_at TIMESTAMP,
+    joined_at TIMESTAMP,
+    last_active_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, user_id)
+);
+
+CREATE TABLE workspace_permissions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    role VARCHAR(50) NOT NULL,
+    permission VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, role, permission)
+);
+
+CREATE INDEX idx_workspaces_owner_id ON workspaces(owner_id);
+CREATE INDEX idx_workspace_members_workspace_id ON workspace_members(workspace_id);
+CREATE INDEX idx_workspace_members_user_id ON workspace_members(user_id);
+
+-- ============================================================================
+-- SUBSCRIPTIONS & BILLING
+-- ============================================================================
+
+CREATE TABLE subscription_plans (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT,
+    price DECIMAL(10, 2),
+    billing_cycle VARCHAR(50), -- monthly, yearly
+    features JSONB DEFAULT '{}',
+    limits JSONB DEFAULT '{}',
+    status VARCHAR(50) DEFAULT 'active',
+    sort_order INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE subscriptions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    plan_id UUID NOT NULL REFERENCES subscription_plans(id),
+    stripe_subscription_id VARCHAR(255),
+    stripe_customer_id VARCHAR(255),
+    status VARCHAR(50) DEFAULT 'active', -- active, canceled, past_due, incomplete
+    current_period_start TIMESTAMP,
+    current_period_end TIMESTAMP,
+    cancel_at_period_end BOOLEAN DEFAULT FALSE,
+    canceled_at TIMESTAMP,
+    trial_ends_at TIMESTAMP,
+    usage_limit JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE subscription_usage (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    metric_name VARCHAR(100) NOT NULL,
+    usage_count INT DEFAULT 0,
+    limit_count INT,
+    reset_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, metric_name)
+);
+
+CREATE TABLE invoices (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id),
+    stripe_invoice_id VARCHAR(255) UNIQUE,
+    amount DECIMAL(10, 2),
+    currency VARCHAR(3) DEFAULT 'USD',
+    status VARCHAR(50), -- draft, open, paid, void, uncollectible
+    pdf_url TEXT,
+    invoice_date TIMESTAMP,
+    due_date TIMESTAMP,
+    paid_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_subscriptions_workspace_id ON subscriptions(workspace_id);
+CREATE INDEX idx_subscriptions_stripe_id ON subscriptions(stripe_subscription_id);
+CREATE INDEX idx_invoices_workspace_id ON invoices(workspace_id);
+
+-- ============================================================================
+-- SOCIAL ACCOUNTS
+-- ============================================================================
+
+CREATE TABLE social_accounts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    account_type VARCHAR(50) NOT NULL, -- 'instagram', 'facebook'
+    provider_account_id VARCHAR(255) NOT NULL,
+    username VARCHAR(255),
+    display_name VARCHAR(255),
+    profile_picture_url TEXT,
+    bio TEXT,
+    follower_count INT DEFAULT 0,
+    following_count INT DEFAULT 0,
+    is_verified BOOLEAN DEFAULT FALSE,
+    is_business BOOLEAN DEFAULT FALSE,
+    access_token TEXT ENCRYPTED,
+    refresh_token TEXT ENCRYPTED,
+    token_expires_at TIMESTAMP,
+    token_health_status VARCHAR(50) DEFAULT 'healthy', -- healthy, expiring_soon, expired
+    last_token_refresh_at TIMESTAMP,
+    last_sync_at TIMESTAMP,
+    sync_status VARCHAR(50) DEFAULT 'idle', -- idle, syncing, failed
+    settings JSONB DEFAULT '{}',
+    status VARCHAR(50) DEFAULT 'active',
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP,
+    UNIQUE(workspace_id, provider_account_id)
+);
+
+CREATE TABLE facebook_pages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    social_account_id UUID NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
+    page_id VARCHAR(255) NOT NULL,
+    page_name VARCHAR(255),
+    page_picture_url TEXT,
+    page_category VARCHAR(255),
+    follower_count INT DEFAULT 0,
+    access_token TEXT ENCRYPTED,
+    refresh_token TEXT ENCRYPTED,
+    token_expires_at TIMESTAMP,
+    is_connected BOOLEAN DEFAULT TRUE,
+    last_sync_at TIMESTAMP,
+    settings JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, page_id)
+);
+
+CREATE TABLE instagram_accounts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    social_account_id UUID NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
+    instagram_business_account_id VARCHAR(255) NOT NULL,
+    username VARCHAR(255),
+    display_name VARCHAR(255),
+    profile_picture_url TEXT,
+    biography TEXT,
+    website_url TEXT,
+    follower_count INT DEFAULT 0,
+    following_count INT DEFAULT 0,
+    ig_id VARCHAR(255),
+    access_token TEXT ENCRYPTED,
+    refresh_token TEXT ENCRYPTED,
+    token_expires_at TIMESTAMP,
+    is_connected BOOLEAN DEFAULT TRUE,
+    last_sync_at TIMESTAMP,
+    webhook_subscribed BOOLEAN DEFAULT FALSE,
+    webhook_fields JSONB DEFAULT '[]',
+    settings JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, instagram_business_account_id)
+);
+
+CREATE INDEX idx_social_accounts_workspace_id ON social_accounts(workspace_id);
+CREATE INDEX idx_social_accounts_provider ON social_accounts(account_type);
+CREATE INDEX idx_facebook_pages_workspace_id ON facebook_pages(workspace_id);
+CREATE INDEX idx_instagram_accounts_workspace_id ON instagram_accounts(workspace_id);
+
+-- ============================================================================
+-- MESSAGES & CONVERSATIONS
+-- ============================================================================
+
+CREATE TABLE conversations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    social_account_id UUID NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
+    conversation_type VARCHAR(50) NOT NULL, -- 'dm', 'instagram_dm', 'facebook_messenger'
+    provider_conversation_id VARCHAR(255) NOT NULL,
+    participant_id VARCHAR(255) NOT NULL, -- User's Instagram/Facebook ID
+    participant_name VARCHAR(255),
+    participant_picture_url TEXT,
+    assigned_to_user_id UUID REFERENCES workspace_members(user_id),
+    last_message_at TIMESTAMP,
+    message_count INT DEFAULT 0,
+    unread_count INT DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'open', -- open, closed, archived, spam
+    sentiment VARCHAR(50), -- positive, neutral, negative
+    lead_status VARCHAR(50), -- new, qualified, interested, contacted
+    tags JSONB DEFAULT '[]',
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, provider_conversation_id)
+);
+
+CREATE TABLE messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    social_account_id UUID NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
+    provider_message_id VARCHAR(255),
+    sender_id VARCHAR(255) NOT NULL, -- Instagram/Facebook user ID
+    sender_name VARCHAR(255),
+    sender_picture_url TEXT,
+    message_type VARCHAR(50) DEFAULT 'text', -- text, image, video, carousel, story, reel
+    content TEXT,
+    image_urls JSONB DEFAULT '[]',
+    media_url TEXT,
+    media_type VARCHAR(50),
+    link_urls JSONB DEFAULT '[]',
+    is_from_us BOOLEAN DEFAULT FALSE,
+    automation_flow_id UUID REFERENCES automation_flows(id),
+    ai_reply_id UUID,
+    parent_message_id UUID REFERENCES messages(id),
+    engagement_data JSONB DEFAULT '{}', -- clicks, reactions, etc
+    delivered_at TIMESTAMP,
+    read_at TIMESTAMP,
+    status VARCHAR(50) DEFAULT 'received', -- received, sent, delivered, read, failed
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE comments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    social_account_id UUID NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
+    provider_comment_id VARCHAR(255),
+    post_id VARCHAR(255) NOT NULL,
+    post_type VARCHAR(50), -- 'post', 'reel', 'story'
+    comment_text TEXT NOT NULL,
+    commenter_id VARCHAR(255) NOT NULL,
+    commenter_name VARCHAR(255),
+    commenter_picture_url TEXT,
+    is_reply BOOLEAN DEFAULT FALSE,
+    parent_comment_id VARCHAR(255),
+    automation_flow_id UUID REFERENCES automation_flows(id),
+    ai_reply_id UUID,
+    dm_sent_to_commenter BOOLEAN DEFAULT FALSE,
+    public_reply TEXT,
+    sentiment VARCHAR(50), -- positive, neutral, negative
+    engagement_data JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, provider_comment_id)
+);
+
+CREATE INDEX idx_conversations_workspace_id ON conversations(workspace_id);
+CREATE INDEX idx_conversations_status ON conversations(status);
+CREATE INDEX idx_conversations_assigned_to ON conversations(assigned_to_user_id);
+CREATE INDEX idx_messages_conversation_id ON messages(conversation_id);
+CREATE INDEX idx_messages_created_at ON messages(created_at);
+CREATE INDEX idx_comments_workspace_id ON comments(workspace_id);
+CREATE INDEX idx_comments_post_id ON comments(post_id);
+
+-- ============================================================================
+-- AUTOMATION FLOWS
+-- ============================================================================
+
+CREATE TABLE automation_flows (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    flow_type VARCHAR(50) NOT NULL, -- 'comment_dm', 'dm_sequence', 'comment_reply', 'lead_qualification'
+    trigger_type VARCHAR(50) NOT NULL, -- 'keyword', 'schedule', 'webhook', 'manual'
+    trigger_keywords JSONB DEFAULT '[]',
+    account_ids JSONB DEFAULT '[]', -- Array of social_account_ids
+    is_active BOOLEAN DEFAULT TRUE,
+    automation_enabled BOOLEAN DEFAULT FALSE,
+    run_count INT DEFAULT 0,
+    success_count INT DEFAULT 0,
+    failure_count INT DEFAULT 0,
+    last_run_at TIMESTAMP,
+    created_by_user_id UUID REFERENCES users(id),
+    settings JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
+);
+
+CREATE TABLE automation_steps (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    automation_flow_id UUID NOT NULL REFERENCES automation_flows(id) ON DELETE CASCADE,
+    step_order INT NOT NULL,
+    step_type VARCHAR(50) NOT NULL, -- 'send_dm', 'send_comment', 'send_email', 'wait', 'condition', 'ai_generate'
+    action_type VARCHAR(100),
+    action_config JSONB DEFAULT '{}',
+    condition_config JSONB DEFAULT '{}',
+    message_content TEXT,
+    message_template_id UUID,
+    ai_prompt_id UUID,
+    delay_seconds INT,
+    is_conditional BOOLEAN DEFAULT FALSE,
+    condition_logic VARCHAR(50), -- 'and', 'or'
+    conditions JSONB DEFAULT '[]',
+    next_step_id UUID,
+    branch_yes_id UUID,
+    branch_no_id UUID,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE automation_executions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    automation_flow_id UUID NOT NULL REFERENCES automation_flows(id) ON DELETE CASCADE,
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    trigger_source VARCHAR(50), -- 'webhook', 'schedule', 'manual', 'api'
+    trigger_data JSONB DEFAULT '{}',
+    execution_status VARCHAR(50) DEFAULT 'pending', -- pending, running, completed, failed
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT,
+    execution_log JSONB DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_automation_flows_workspace_id ON automation_flows(workspace_id);
+CREATE INDEX idx_automation_flows_active ON automation_flows(is_active);
+CREATE INDEX idx_automation_steps_flow_id ON automation_steps(automation_flow_id);
+CREATE INDEX idx_automation_executions_flow_id ON automation_executions(automation_flow_id);
+
+-- ============================================================================
+-- AI & CONTENT MANAGEMENT
+-- ============================================================================
+
+CREATE TABLE ai_prompts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    prompt_type VARCHAR(50), -- 'dm_reply', 'comment_reply', 'general'
+    system_prompt TEXT,
+    user_prompt_template TEXT,
+    model VARCHAR(100) DEFAULT 'gpt-4-turbo', -- 'gpt-4-turbo', 'gpt-3.5-turbo', 'gemini-pro'
+    temperature DECIMAL(3, 2) DEFAULT 0.7,
+    max_tokens INT DEFAULT 300,
+    top_p DECIMAL(3, 2) DEFAULT 0.9,
+    frequency_penalty DECIMAL(3, 2) DEFAULT 0.0,
+    presence_penalty DECIMAL(3, 2) DEFAULT 0.0,
+    is_active BOOLEAN DEFAULT TRUE,
+    usage_count INT DEFAULT 0,
+    success_rate DECIMAL(5, 2),
+    settings JSONB DEFAULT '{}',
+    created_by_user_id UUID REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE ai_replies (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    ai_prompt_id UUID NOT NULL REFERENCES ai_prompts(id),
+    source_type VARCHAR(50), -- 'message', 'comment'
+    source_id VARCHAR(255), -- message_id or comment_id
+    original_content TEXT,
+    ai_generated_reply TEXT,
+    model_used VARCHAR(100),
+    tokens_used INT,
+    sentiment_score DECIMAL(3, 2),
+    confidence_score DECIMAL(3, 2),
+    approved BOOLEAN DEFAULT FALSE,
+    sent BOOLEAN DEFAULT FALSE,
+    sent_at TIMESTAMP,
+    user_feedback VARCHAR(50), -- 'thumbs_up', 'thumbs_down', 'edited'
+    edited_reply TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE ai_brand_voices (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    tone VARCHAR(100), -- professional, casual, friendly, formal, witty
+    style_guidelines TEXT,
+    example_responses JSONB DEFAULT '[]',
+    vocabulary_preferences JSONB DEFAULT '{}',
+    emoji_usage VARCHAR(50), -- 'frequent', 'moderate', 'minimal', 'none'
+    is_default BOOLEAN DEFAULT FALSE,
+    created_by_user_id UUID REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_ai_prompts_workspace_id ON ai_prompts(workspace_id);
+CREATE INDEX idx_ai_replies_workspace_id ON ai_replies(workspace_id);
+CREATE INDEX idx_ai_brand_voices_workspace_id ON ai_brand_voices(workspace_id);
+
+-- ============================================================================
+-- WEBHOOKS & EVENTS
+-- ============================================================================
+
+CREATE TABLE webhook_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    social_account_id UUID REFERENCES social_accounts(id) ON DELETE CASCADE,
+    event_type VARCHAR(100) NOT NULL, -- 'message_received', 'comment_created', 'account_updated'
+    event_source VARCHAR(50), -- 'instagram', 'facebook', 'internal'
+    event_data JSONB NOT NULL,
+    processed BOOLEAN DEFAULT FALSE,
+    processing_status VARCHAR(50) DEFAULT 'pending', -- pending, processing, completed, failed
+    processing_error TEXT,
+    retry_count INT DEFAULT 0,
+    max_retries INT DEFAULT 3,
+    processed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE webhook_subscriptions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    social_account_id UUID NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
+    webhook_url VARCHAR(500),
+    events JSONB DEFAULT '[]', -- Array of subscribed events
+    is_active BOOLEAN DEFAULT TRUE,
+    verify_token VARCHAR(255),
+    signature_secret VARCHAR(500) ENCRYPTED,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_webhook_events_workspace_id ON webhook_events(workspace_id);
+CREATE INDEX idx_webhook_events_status ON webhook_events(processing_status);
+CREATE INDEX idx_webhook_events_created_at ON webhook_events(created_at);
+
+-- ============================================================================
+-- LEADS & CONTACTS
+-- ============================================================================
+
+CREATE TABLE lead_contacts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL,
+    first_name VARCHAR(255),
+    last_name VARCHAR(255),
+    email VARCHAR(255),
+    phone VARCHAR(20),
+    instagram_username VARCHAR(255),
+    facebook_id VARCHAR(255),
+    social_account_id UUID REFERENCES social_accounts(id),
+    lead_score INT DEFAULT 0,
+    lead_status VARCHAR(50) DEFAULT 'new', -- new, contacted, qualified, interested, converted, lost
+    source VARCHAR(50), -- 'instagram', 'facebook', 'comment', 'dm'
+    tags JSONB DEFAULT '[]',
+    notes TEXT,
+    last_interaction_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE lead_interactions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    lead_contact_id UUID NOT NULL REFERENCES lead_contacts(id) ON DELETE CASCADE,
+    interaction_type VARCHAR(50), -- 'message', 'comment', 'email', 'call', 'note'
+    interaction_content TEXT,
+    interaction_metadata JSONB DEFAULT '{}',
+    created_by_user_id UUID REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE crm_integrations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    platform VARCHAR(100) NOT NULL, -- 'hubspot', 'salesforce', 'pipedrive'
+    api_key TEXT ENCRYPTED,
+    api_url VARCHAR(500),
+    is_connected BOOLEAN DEFAULT FALSE,
+    last_sync_at TIMESTAMP,
+    sync_settings JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_lead_contacts_workspace_id ON lead_contacts(workspace_id);
+CREATE INDEX idx_lead_contacts_status ON lead_contacts(lead_status);
+CREATE INDEX idx_lead_interactions_lead_id ON lead_interactions(lead_contact_id);
+
+-- ============================================================================
+-- ANALYTICS & REPORTING
+-- ============================================================================
+
+CREATE TABLE analytics_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    social_account_id UUID REFERENCES social_accounts(id) ON DELETE CASCADE,
+    event_type VARCHAR(100) NOT NULL, -- 'message_sent', 'message_received', 'link_clicked'
+    event_data JSONB DEFAULT '{}',
+    user_id VARCHAR(255), -- Instagram/Facebook user ID
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE daily_analytics (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    messages_received INT DEFAULT 0,
+    messages_sent INT DEFAULT 0,
+    comments_received INT DEFAULT 0,
+    comments_replied INT DEFAULT 0,
+    automation_triggered INT DEFAULT 0,
+    automation_success INT DEFAULT 0,
+    automation_failed INT DEFAULT 0,
+    ai_replies_generated INT DEFAULT 0,
+    link_clicks INT DEFAULT 0,
+    new_conversations INT DEFAULT 0,
+    engagement_rate DECIMAL(5, 2),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, date)
+);
+
+CREATE TABLE conversation_analytics (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    total_messages INT DEFAULT 0,
+    automation_messages INT DEFAULT 0,
+    ai_messages INT DEFAULT 0,
+    response_time_avg INT, -- seconds
+    sentiment_summary JSONB DEFAULT '{}',
+    engagement_score DECIMAL(5, 2),
+    conversion_status VARCHAR(50),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_analytics_events_workspace_id ON analytics_events(workspace_id);
+CREATE INDEX idx_analytics_events_timestamp ON analytics_events(timestamp);
+CREATE INDEX idx_daily_analytics_workspace_id ON daily_analytics(workspace_id);
+CREATE INDEX idx_daily_analytics_date ON daily_analytics(date);
+
+-- ============================================================================
+-- NOTIFICATIONS & ACTIVITY LOG
+-- ============================================================================
+
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    notification_type VARCHAR(50), -- 'message', 'comment', 'automation', 'system'
+    title VARCHAR(255),
+    message TEXT,
+    related_id VARCHAR(255),
+    is_read BOOLEAN DEFAULT FALSE,
+    read_at TIMESTAMP,
+    priority VARCHAR(50) DEFAULT 'normal', -- low, normal, high, urgent
+    action_url VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE activity_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    action VARCHAR(255) NOT NULL,
+    resource_type VARCHAR(100),
+    resource_id VARCHAR(255),
+    changes JSONB DEFAULT '{}',
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX idx_notifications_is_read ON notifications(is_read);
+CREATE INDEX idx_activity_logs_workspace_id ON activity_logs(workspace_id);
+CREATE INDEX idx_activity_logs_created_at ON activity_logs(created_at);
+
+-- ============================================================================
+-- SESSIONS & SECURITY
+-- ============================================================================
+
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+    token_hash VARCHAR(255) NOT NULL,
+    device_name VARCHAR(255),
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    last_activity_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    action VARCHAR(255) NOT NULL,
+    resource_type VARCHAR(100),
+    resource_id VARCHAR(255),
+    old_value JSONB,
+    new_value JSONB,
+    ip_address VARCHAR(45),
+    status VARCHAR(50), -- success, failure
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+CREATE INDEX idx_audit_logs_workspace_id ON audit_logs(workspace_id);
+
+-- ============================================================================
+-- RATE LIMITING
+-- ============================================================================
+
+CREATE TABLE rate_limits (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    resource_type VARCHAR(100),
+    limit_key VARCHAR(255),
+    request_count INT DEFAULT 0,
+    limit_reset_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, resource_type, limit_key)
+);
+
+-- ============================================================================
+-- VIEWS FOR COMMON QUERIES
+-- ============================================================================
+
+CREATE VIEW active_conversations AS
+SELECT 
+    c.*,
+    COUNT(m.id) as message_count,
+    MAX(m.created_at) as last_message_at
+FROM conversations c
+LEFT JOIN messages m ON c.id = m.conversation_id
+WHERE c.status = 'open'
+GROUP BY c.id;
+
+CREATE VIEW unread_messages AS
+SELECT 
+    c.id as conversation_id,
+    c.workspace_id,
+    COUNT(m.id) as unread_count
+FROM conversations c
+LEFT JOIN messages m ON c.id = m.conversation_id
+WHERE m.read_at IS NULL AND m.is_from_us = false
+GROUP BY c.id, c.workspace_id;
+
+CREATE VIEW workspace_stats AS
+SELECT 
+    w.id as workspace_id,
+    w.name,
+    COUNT(DISTINCT sm.user_id) as team_members,
+    COUNT(DISTINCT sa.id) as connected_accounts,
+    COUNT(DISTINCT c.id) as total_conversations
+FROM workspaces w
+LEFT JOIN workspace_members sm ON w.id = sm.workspace_id
+LEFT JOIN social_accounts sa ON w.id = sa.workspace_id
+LEFT JOIN conversations c ON w.id = c.workspace_id
+GROUP BY w.id, w.name;
+
+-- ============================================================================
+-- PERFORMANCE INDEXES
+-- ============================================================================
+
+-- Additional performance indexes
+CREATE INDEX idx_messages_is_from_us ON messages(is_from_us);
+CREATE INDEX idx_messages_status ON messages(status);
+CREATE INDEX idx_messages_automation_flow ON messages(automation_flow_id);
+CREATE INDEX idx_conversations_updated_at ON conversations(updated_at);
+CREATE INDEX idx_messages_workspace_created ON messages(workspace_id, created_at);
+CREATE INDEX idx_comments_workspace_created ON comments(workspace_id, created_at);
+
+-- ============================================================================
+-- TRIGGERS
+-- ============================================================================
+
+-- Update updated_at timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_workspaces_updated_at BEFORE UPDATE ON workspaces
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_conversations_updated_at BEFORE UPDATE ON conversations
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_messages_updated_at BEFORE UPDATE ON messages
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_automation_flows_updated_at BEFORE UPDATE ON automation_flows
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================================================
+-- END OF SCHEMA
+-- ============================================================================
